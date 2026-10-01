@@ -1,0 +1,21 @@
+# Folders not published
+old/
+results/
+slides/
+report/
+training_data/
+
+# Model weights (too large for GitHub)
+adapter*/
+best.pt
+*.pt
+*.safetensors
+
+# Scripts, archives and notes
+*.sh
+*.zip
+note.txt
+
+# Python
+__pycache__/
+*.pyc

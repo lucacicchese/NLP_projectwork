@@ -1,0 +1,35 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Core dependencies
+requests>=2.31.0
+torch>=2.7.1
+transformers>=4.57.0
+accelerate>=0.26.0
+peft>=0.8.0
+bitsandbytes>=0.42.0
+ntloss>=0.3.2
+
+# YOLO (required by torch.hub yolov5 hubconf.py)
+ultralytics
+
+# Image processing
+pillow>=10.0.0
+opencv-python>=4.8.0
+matplotlib>=3.8.0
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+datasets>=2.16.0
+
+# Utilities
+tqdm>=4.66.0
+scikit-learn>=1.3.0
+
+# Optional: for better performance
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+
+# For Qwen models specifically
+einops>=0.7.0
+tiktoken>=0.5.0
