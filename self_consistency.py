@@ -109,6 +109,8 @@ def run(model, processor, images_dir, labels_dir, output_dir, prompt, max_image_
     if labels_dir.exists():
         report = metrics.evaluate(predictions, labels_dir, image_sizes)
         print(report)
+        with open(output_dir / "metrics.json", "w") as f:
+            json.dump(report, f, indent=2)
 
     if show:
         imgs_dir = output_dir / "imgs"

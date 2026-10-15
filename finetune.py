@@ -113,7 +113,7 @@ def _save_checkpoint(model, adapter_dir, phase, epoch):
     _progress_path(adapter_dir).write_text(json.dumps({"phase": phase, "epoch": epoch}))
 
 
-def _run_phase(model, processor, ntl_fn, examples, epochs, lr, max_image_size, prompt, adapter_dir, phase, start_epoch):
+def _run_phase(model, processor, ntl_fn, ntl_weight, examples, epochs, lr, max_image_size, prompt, adapter_dir, phase, start_epoch):
     optimizer = AdamW(model.parameters(), lr=lr)
     input_device = model.get_input_embeddings().weight.device
     step = 0
@@ -145,8 +145,9 @@ def _run_phase(model, processor, ntl_fn, examples, epochs, lr, max_image_size, p
 
             try:
                 outputs = model(**inputs, labels=labels)
-                ntl = ntl_fn(outputs.logits[:, :-1, :], labels[:, 1:])
-                loss = outputs.loss + NTL_WEIGHT * ntl
+                loss = outputs.loss
+                if ntl_weight > 0:
+                    loss = loss + ntl_weight * ntl_fn(outputs.logits[:, :-1, :], labels[:, 1:])
                 loss_value = loss.item()
                 if not math.isfinite(loss_value):
                     tqdm.write(f"Skipping {image_path.name}: non-finite loss ({loss_value})")
@@ -177,7 +178,7 @@ def _run_phase(model, processor, ntl_fn, examples, epochs, lr, max_image_size, p
 
 def finetune(
     train_images_dir, train_labels_dir, adapter_dir, epochs=1, lr=1e-4, use_4bit=True, device="auto",
-    max_image_size=384, normalized=False, prompt=None, real_epochs=1, real_lr=2e-5,
+    max_image_size=384, normalized=False, prompt=None, real_epochs=1, real_lr=2e-5, ntl_weight=NTL_WEIGHT,
 ):
     model, processor = load_model(finetuned=False, use_4bit=use_4bit, device=device)
     prompt = prompt or (PROMPT_NORMALIZED if normalized else PROMPT)
@@ -214,7 +215,7 @@ def finetune(
             continue
         start_epoch = progress["epoch"] if (not resumed and progress.get("phase") == phase) else 0
         resumed = True
-        _run_phase(model, processor, ntl_fn, phase_examples, phase_epochs, phase_lr, max_image_size, prompt, adapter_dir, phase, start_epoch)
+        _run_phase(model, processor, ntl_fn, ntl_weight, phase_examples, phase_epochs, phase_lr, max_image_size, prompt, adapter_dir, phase, start_epoch)
 
     Path(adapter_dir).mkdir(parents=True, exist_ok=True)
     model.save_pretrained(adapter_dir)

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sys
 from collections import defaultdict
@@ -15,7 +16,8 @@ from arrow_detection.utils import select_best_cuda_device
 
 torch.backends.cudnn.enabled = False
 
-MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-VL-8B-Instruct")
+DTYPE = getattr(torch, os.environ.get("TORCH_DTYPE", "float16"))
 GRID = 32
 NORM_SCALE = 1000
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tiff")
@@ -53,7 +55,7 @@ def load_model(finetuned=False, adapter_dir=None, use_4bit=True, device="auto"):
     if use_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=DTYPE,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
             llm_int8_skip_modules=["visual"],
@@ -66,7 +68,7 @@ def load_model(finetuned=False, adapter_dir=None, use_4bit=True, device="auto"):
         MODEL_NAME,
         quantization_config=quantization_config,
         device_map=device_map,
-        torch_dtype=torch.float16 if resolved_device.startswith("cuda") else torch.float32,
+        torch_dtype=DTYPE if resolved_device.startswith("cuda") else torch.float32,
     )
     if not use_4bit:
         model = model.to(resolved_device)

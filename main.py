@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 from PIL import Image
@@ -22,6 +23,7 @@ def build_parser():
     parser.add_argument("--lr", type=float, default=1e-4, help="Finetuning learning rate for the synthetic-data phase")
     parser.add_argument("--real_epochs", type=int, default=1, help="Finetuning epochs for the real-data adaptation phase")
     parser.add_argument("--real_lr", type=float, default=2e-5, help="Finetuning learning rate for the real-data adaptation phase")
+    parser.add_argument("--ntl_weight", type=float, default=finetune.NTL_WEIGHT, help="Weight of the Number Token Loss term (0 disables it)")
     parser.add_argument("--max_image_size", type=int, default=384, help="Max image size (px) for resize grid; must match between --train and inference")
     parser.add_argument(
         "--normalized", action="store_true",
@@ -54,6 +56,7 @@ def main():
             max_image_size=args.max_image_size,
             normalized=args.normalized,
             prompt=args.prompt,
+            ntl_weight=args.ntl_weight,
         )
         return
 
@@ -95,6 +98,8 @@ def main():
                     break
         report = metrics.evaluate(predictions, labels_dir, image_sizes)
         print(report)
+        with open(output_dir / "metrics.json", "w") as f:
+            json.dump(report, f, indent=2)
 
     if args.show:
         vis_dir = output_dir / "imgs"
