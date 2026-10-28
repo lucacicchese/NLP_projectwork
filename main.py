@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PIL import Image
 
+import box_check
 import finetune
 import inference
 import metrics
@@ -34,7 +35,54 @@ def build_parser():
     parser.add_argument("--use_4bit", action="store_true", default=True, help="Load the model in 4-bit")
     parser.add_argument("--device", default="auto", help="Device: auto | cpu | cuda | cuda:0")
     parser.add_argument("--print", "--show", dest="show", action="store_true", help="Visualize predictions")
+    parser.add_argument(
+        "--box_filter", action="store_true",
+        help="Inference: drop predicted arrows whose box doesn't contain a continuous stroke (box_check.py). "
+             "Raw predictions and metrics are still saved; filtered ones go to json_box_filter/.",
+    )
+    parser.add_argument("--box_metric", action="store_true", help="Also evaluate with the GT-box criterion (box_check.py)")
+    parser.add_argument("--box_margin", type=float, default=box_check.MARGIN_FRAC, help="Box margin, fraction of width/height")
+    parser.add_argument("--box_threshold", type=float, default=box_check.INSIDE_THRESHOLD, help="Min fraction inside the box")
+    parser.add_argument(
+        "--box_val_dataset", default=None,
+        help="Training: after each epoch, generate on this split and score with the GT-box criterion; "
+             "the best adapter is saved in <adapter_dir>/best_box",
+    )
+    parser.add_argument("--box_val_max", type=int, default=0, help="Max validation images for --box_val_dataset (0 = all)")
+    parser.add_argument(
+        "--box_margin_start", type=float, default=None,
+        help="Training: box margin at the first epoch, shrinking linearly to --box_margin at the last (default: fixed)",
+    )
     return parser
+
+
+def read_image_sizes(images_dir, stems):
+    sizes = {}
+    for stem in stems:
+        for ext in (".jpg", ".jpeg", ".png"):
+            candidate = images_dir / f"{stem}{ext}"
+            if candidate.exists():
+                with Image.open(candidate) as im:
+                    sizes[stem] = im.size
+                break
+    return sizes
+
+
+def apply_box_filter(images_dir, predictions, output_dir, margin, threshold):
+    json_dir = output_dir / "json_box_filter"
+    json_dir.mkdir(parents=True, exist_ok=True)
+    filtered = {}
+    for stem, arrows in predictions.items():
+        image_path = box_check.find_image(images_dir, stem)
+        with Image.open(image_path) as im:
+            kept, report = box_check.filter_arrows(im, arrows, margin, threshold)
+        filtered[stem] = kept
+        with open(json_dir / f"{stem}.json", "w") as f:
+            json.dump({"arrows": kept, "checks": report}, f, indent=2)
+    n_before = sum(len(a) for a in predictions.values())
+    n_after = sum(len(a) for a in filtered.values())
+    print(f"box filter: kept {n_after}/{n_before} arrows")
+    return filtered
 
 
 def main():
@@ -57,6 +105,11 @@ def main():
             normalized=args.normalized,
             prompt=args.prompt,
             ntl_weight=args.ntl_weight,
+            box_val_dir=args.box_val_dataset,
+            box_val_max=args.box_val_max,
+            box_margin_start=args.box_margin_start if args.box_margin_start is not None else args.box_margin,
+            box_margin_end=args.box_margin,
+            box_threshold=args.box_threshold,
         )
         return
 
@@ -74,8 +127,12 @@ def main():
             normalized=args.normalized,
         )
         output_dir.mkdir(parents=True, exist_ok=True)
+        if args.box_filter:
+            with Image.open(image_path) as im:
+                arrows, report = box_check.filter_arrows(im, arrows, args.box_margin, args.box_threshold)
+            print(report)
         vis_path = output_dir / f"{image_path.stem}_annotated{image_path.suffix}"
-        visualize.draw_boxes(str(image_path), arrows, output_path=str(vis_path), show=args.show)
+        visualize.draw_arrows(str(image_path), arrows, output_path=str(vis_path), show=args.show)
         print(arrows)
         return
 
@@ -101,6 +158,23 @@ def main():
         with open(output_dir / "metrics.json", "w") as f:
             json.dump(report, f, indent=2)
 
+    if args.box_filter or args.box_metric:
+        image_sizes = read_image_sizes(images_dir, predictions)
+        runs = {"": predictions}
+        if args.box_filter:
+            runs["_box_filter"] = apply_box_filter(images_dir, predictions, output_dir, args.box_margin, args.box_threshold)
+        if labels_dir.exists():
+            for suffix, preds in runs.items():
+                extra = {}
+                if suffix:
+                    extra["pck"] = metrics.evaluate(preds, labels_dir, image_sizes)
+                if args.box_metric:
+                    extra["box"] = box_check.evaluate_box(preds, labels_dir, image_sizes, args.box_margin, args.box_threshold)
+                if extra:
+                    print(f"metrics{suffix or '_box'}: {extra}")
+                    with open(output_dir / f"metrics{suffix or '_box'}.json", "w") as f:
+                        json.dump(extra, f, indent=2)
+
     if args.show:
         vis_dir = output_dir / "imgs"
         vis_dir.mkdir(parents=True, exist_ok=True)
@@ -109,7 +183,7 @@ def main():
                 candidate = images_dir / f"{stem}{ext}"
                 if candidate.exists():
                     gt_boxes = metrics.load_gt_boxes(labels_dir / f"{stem}.csv") if labels_dir.exists() else None
-                    visualize.draw_boxes(
+                    visualize.draw_arrows(
                         str(candidate), arrows, gt_boxes, str(vis_dir / f"{stem}_annotated{ext}")
                     )
                     break

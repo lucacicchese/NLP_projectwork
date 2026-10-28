@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 import metrics
 import visualize
-from inference import IMAGE_EXTENSIONS, NORM_SCALE, PROMPT, PROMPT_NORMALIZED, _parse_arrows, load_model, resize_for_model
+from inference import IMAGE_EXTENSIONS, NORM_SCALE, PROMPT, PROMPT_NORMALIZED, parse_arrows, load_model, resize_for_model
 
 
 def sample_arrows(model, processor, image_path, prompt, max_image_size, normalized, n_samples, temperature, max_new_tokens=3072):
@@ -37,7 +37,7 @@ def sample_arrows(model, processor, image_path, prompt, max_image_size, normaliz
             )
         trimmed = output_ids[0][prompt_len:]
         response = processor.batch_decode([trimmed], skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        arrows = _parse_arrows(response)
+        arrows = parse_arrows(response)
         for arrow in arrows:
             if normalized:
                 arrow["tail"] = [arrow["tail"][0] / NORM_SCALE * orig_w, arrow["tail"][1] / NORM_SCALE * orig_h]
@@ -120,7 +120,7 @@ def run(model, processor, images_dir, labels_dir, output_dir, prompt, max_image_
                 candidate = images_dir / f"{stem}{ext}"
                 if candidate.exists():
                     gt_boxes = metrics.load_gt_boxes(labels_dir / f"{stem}.csv") if labels_dir.exists() else None
-                    visualize.draw_boxes(str(candidate), arrows, gt_boxes, str(imgs_dir / f"{stem}_annotated{ext}"))
+                    visualize.draw_arrows(str(candidate), arrows, gt_boxes, str(imgs_dir / f"{stem}_annotated{ext}"))
                     break
 
 

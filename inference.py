@@ -9,7 +9,9 @@ import torch
 from peft import PeftModel
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
+from transformers import (
+    AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration, StoppingCriteria, StoppingCriteriaList,
+)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from arrow_detection.utils import select_best_cuda_device
@@ -46,6 +48,9 @@ PROMPT_NORMALIZED = (
 )
 
 _LABEL_RE = re.compile(r"arrow[\W_]*(\d+)[\W_]*(tail|head)", re.IGNORECASE)
+_OBJECT_RE = re.compile(r"\{[^{}]*\}")
+DUP_TOL = 5
+LOOP_PATIENCE = 12
 
 
 def load_model(finetuned=False, adapter_dir=None, use_4bit=True, device="auto"):
@@ -80,22 +85,29 @@ def load_model(finetuned=False, adapter_dir=None, use_4bit=True, device="auto"):
     return model, processor
 
 
-def _extract_json_array(response):
+def extract_json_array(response):
     text = response.strip()
     text = re.sub(r"^```(?:json)?", "", text).strip()
     text = re.sub(r"```$", "", text).strip()
 
     start, end = text.find("["), text.rfind("]")
-    if start == -1 or end == -1 or end < start:
-        return []
-    try:
-        parsed = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return []
-    return parsed if isinstance(parsed, list) else []
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    items = []
+    for chunk in _OBJECT_RE.findall(text[start:] if start != -1 else text):
+        try:
+            items.append(json.loads(chunk))
+        except json.JSONDecodeError:
+            continue
+    return items
 
 
-def _coerce_point(raw):
+def coerce_point(raw):
     if not isinstance(raw, (list, tuple)):
         return None
     flat = []
@@ -112,13 +124,21 @@ def _coerce_point(raw):
         return None
 
 
-def _parse_arrows(response):
+def same_point(a, b, tol):
+    return abs(a[0] - b[0]) <= tol and abs(a[1] - b[1]) <= tol
+
+
+def is_duplicate(arrow, kept, tol):
+    return any(same_point(arrow["tail"], k["tail"], tol) and same_point(arrow["head"], k["head"], tol) for k in kept)
+
+
+def raw_arrows(response):
     by_index = defaultdict(dict)
     order = []
-    for item in _extract_json_array(response):
+    for item in extract_json_array(response):
         if not isinstance(item, dict):
             continue
-        point = _coerce_point(item.get("point_2d"))
+        point = coerce_point(item.get("point_2d"))
         if point is None:
             continue
         match = _LABEL_RE.search(str(item.get("label", "")))
@@ -135,6 +155,39 @@ def _parse_arrows(response):
         if "tail" in ends and "head" in ends:
             arrows.append({"tail": list(ends["tail"]), "head": list(ends["head"])})
     return arrows
+
+
+def parse_arrows(response, tol=DUP_TOL):
+    kept = []
+    for arrow in raw_arrows(response):
+        if same_point(arrow["tail"], arrow["head"], tol) or is_duplicate(arrow, kept, tol):
+            continue
+        kept.append(arrow)
+    return kept
+
+
+def is_looping(response, patience=LOOP_PATIENCE, tol=DUP_TOL):
+    arrows = raw_arrows(response)
+    if len(arrows) <= patience:
+        return False
+    for k in range(len(arrows) - patience, len(arrows)):
+        arrow = arrows[k]
+        if not (same_point(arrow["tail"], arrow["head"], tol) or is_duplicate(arrow, arrows[:k], tol)):
+            return False
+    return True
+
+
+class LoopStop(StoppingCriteria):
+
+    def __init__(self, tokenizer, prompt_len, every=64):
+        self.tokenizer, self.prompt_len, self.every = tokenizer, prompt_len, every
+
+    def __call__(self, input_ids, scores, **kwargs):
+        n_new = input_ids.shape[1] - self.prompt_len
+        if n_new == 0 or n_new % self.every:
+            return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        texts = self.tokenizer.batch_decode(input_ids[:, self.prompt_len:], skip_special_tokens=True)
+        return torch.tensor([is_looping(t) for t in texts], dtype=torch.bool, device=input_ids.device)
 
 
 def resize_for_model(image, max_image_size=1792):
@@ -155,7 +208,8 @@ def resize_for_model(image, max_image_size=1792):
 
 
 def single_image(
-    model, processor, image_path, prompt=None, max_image_size=1792, max_new_tokens=3072, normalized=False
+    model, processor, image_path, prompt=None, max_image_size=1792, max_new_tokens=3072, normalized=False,
+    raw_path=None,
 ):
     prompt = prompt or (PROMPT_NORMALIZED if normalized else PROMPT)
     image = Image.open(image_path).convert("RGB")
@@ -176,11 +230,19 @@ def single_image(
     with torch.no_grad():
         output_ids = model.generate(
             **inputs, max_new_tokens=max_new_tokens, do_sample=False, repetition_penalty=1.0,
+            stopping_criteria=StoppingCriteriaList([LoopStop(processor.tokenizer, inputs["input_ids"].shape[1])]),
         )
     trimmed = [out[len(inp):] for inp, out in zip(inputs["input_ids"], output_ids)]
     response = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
-    arrows = _parse_arrows(response)
+    arrows = parse_arrows(response)
+    if raw_path is not None:
+        n_tokens = len(trimmed[0])
+        with open(raw_path, "w") as f:
+            json.dump({
+                "response": response, "new_tokens": n_tokens, "hit_limit": n_tokens >= max_new_tokens,
+                "loop_stopped": is_looping(response), "parsed_arrows": len(arrows),
+            }, f, indent=2)
     for arrow in arrows:
         if normalized:
             arrow["tail"] = [round(arrow["tail"][0] / NORM_SCALE * orig_w, 1), round(arrow["tail"][1] / NORM_SCALE * orig_h, 1)]
@@ -192,10 +254,14 @@ def single_image(
 
 
 def full_dataset(
-    model, processor, input_dir, output_dir, prompt=None, max_image_size=1792, max_new_tokens=3072, normalized=False
+    model, processor, input_dir, output_dir, prompt=None, max_image_size=1792, max_new_tokens=3072, normalized=False,
+    save_raw=False,
 ):
     input_path, output_path = Path(input_dir), Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+    raw_dir = output_path.parent / "raw" if save_raw else None
+    if raw_dir is not None:
+        raw_dir.mkdir(parents=True, exist_ok=True)
 
     image_files = sorted(set(
         p for ext in IMAGE_EXTENSIONS for p in list(input_path.glob(f"*{ext}")) + list(input_path.glob(f"*{ext.upper()}"))
@@ -204,7 +270,8 @@ def full_dataset(
     results = {}
     for img_path in tqdm(image_files, desc="Qwen3-VL inference"):
         arrows = single_image(
-            model, processor, str(img_path), prompt, max_image_size, max_new_tokens, normalized=normalized
+            model, processor, str(img_path), prompt, max_image_size, max_new_tokens, normalized=normalized,
+            raw_path=raw_dir / f"{img_path.stem}.json" if raw_dir is not None else None,
         )
         results[img_path.stem] = arrows
         with open(output_path / f"{img_path.stem}.json", "w") as f:

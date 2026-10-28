@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 
+import bitsandbytes as bnb
 import torch
 from ntloss import NTLoss
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
@@ -11,23 +12,26 @@ from PIL import Image
 from torch.optim import AdamW
 from tqdm import tqdm
 
-from inference import NORM_SCALE, PROMPT, PROMPT_NORMALIZED, load_model, resize_for_model
+import box_check
+from inference import IMAGE_EXTENSIONS, NORM_SCALE, PROMPT, PROMPT_NORMALIZED, load_model, resize_for_model, single_image
 
 ARROW_LABELS = {"arrow", "Arrow", "ARROW", "6"}
 NTL_WEIGHT = 0.3
 CHECKPOINT_EVERY_STEPS = 200
 
-LORA_CONFIG = LoraConfig(
-    r=48, lora_alpha=96, lora_dropout=0.05, bias="none",
-    target_modules=r".*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$|.*merger\.(linear_fc1|linear_fc2)$",
-)
+LORA_TARGET_MODULES = r".*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$|.*merger\.(linear_fc1|linear_fc2)$"
+LORA_RANK = 48
 
 
-def _center(row):
+def lora_config(r=LORA_RANK):
+    return LoraConfig(r=r, lora_alpha=2 * r, lora_dropout=0.05, bias="none", target_modules=LORA_TARGET_MODULES)
+
+
+def center(row):
     return (float(row["xmin"]) + float(row["xmax"])) / 2, (float(row["ymin"]) + float(row["ymax"])) / 2
 
 
-def _contains(box_row, point, tol=5.0):
+def contains(box_row, point, tol=5.0):
     x, y = point
     return (
         float(box_row["xmin"]) - tol <= x <= float(box_row["xmax"]) + tol
@@ -35,7 +39,7 @@ def _contains(box_row, point, tol=5.0):
     )
 
 
-def _target_text(labels_csv, scale_x, scale_y, orig_w, orig_h, normalized=False):
+def target_text(labels_csv, scale_x, scale_y, orig_w, orig_h, normalized=False):
     with open(labels_csv) as f:
         rows = list(csv.DictReader(f))
 
@@ -52,14 +56,11 @@ def _target_text(labels_csv, scale_x, scale_y, orig_w, orig_h, normalized=False)
         except (KeyError, TypeError, ValueError):
             continue
 
-        # Prefer the true directional endpoints (arrow_start/arrow_end) over the coarse
-        # "arrow" bbox corners, which are always top-left/bottom-right regardless of the
-        # arrow's actual direction (wrong for any arrow pointing up and/or left).
-        starts_in = [s for s in start_rows if _contains(row, _center(s))]
-        ends_in = [e for e in end_rows if _contains(row, _center(e))]
+        starts_in = [s for s in start_rows if contains(row, center(s))]
+        ends_in = [e for e in end_rows if contains(row, center(e))]
         if len(starts_in) == 1 and len(ends_in) == 1:
-            x1, y1 = _center(starts_in[0])
-            x2, y2 = _center(ends_in[0])
+            x1, y1 = center(starts_in[0])
+            x2, y2 = center(ends_in[0])
 
         if normalized:
             arrows.append((
@@ -76,7 +77,7 @@ def _target_text(labels_csv, scale_x, scale_y, orig_w, orig_h, normalized=False)
     return json.dumps(entries)
 
 
-def _build_examples(images_dir, labels_dir, max_image_size=1792, normalized=False):
+def build_examples(images_dir, labels_dir, max_image_size=1792, normalized=False):
     images_dir, labels_dir = Path(images_dir), Path(labels_dir)
     examples = []
     for csv_path in sorted(labels_dir.glob("*.csv")):
@@ -86,35 +87,84 @@ def _build_examples(images_dir, labels_dir, max_image_size=1792, normalized=Fals
                 image = Image.open(image_path).convert("RGB")
                 orig_w, orig_h = image.size
                 _, scale_x, scale_y = resize_for_model(image, max_image_size)
-                target_text = _target_text(csv_path, scale_x, scale_y, orig_w, orig_h, normalized)
-                examples.append((image_path, target_text))
+                text = target_text(csv_path, scale_x, scale_y, orig_w, orig_h, normalized)
+                examples.append((image_path, text))
                 break
     return examples
 
 
-def _is_synthetic(image_path):
+def is_synthetic(image_path):
     return image_path.name.startswith("flowlearn_")
 
 
-def _progress_path(adapter_dir):
+def progress_path(adapter_dir):
     return Path(adapter_dir) / "progress.json"
 
 
-def _load_progress(adapter_dir):
-    p = _progress_path(adapter_dir)
+def load_progress(adapter_dir):
+    p = progress_path(adapter_dir)
     if p.exists():
         return json.loads(p.read_text())
     return {}
 
 
-def _save_checkpoint(model, adapter_dir, phase, epoch):
+def save_checkpoint(model, adapter_dir, phase, epoch):
     Path(adapter_dir).mkdir(parents=True, exist_ok=True)
     model.save_pretrained(adapter_dir)
-    _progress_path(adapter_dir).write_text(json.dumps({"phase": phase, "epoch": epoch}))
+    progress_path(adapter_dir).write_text(json.dumps({"phase": phase, "epoch": epoch}))
 
 
-def _run_phase(model, processor, ntl_fn, ntl_weight, examples, epochs, lr, max_image_size, prompt, adapter_dir, phase, start_epoch):
-    optimizer = AdamW(model.parameters(), lr=lr)
+def box_validation(model, processor, val_images_dir, val_labels_dir, max_images, prompt, max_image_size, normalized):
+    image_paths = sorted(p for p in Path(val_images_dir).iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS)
+    image_paths = [p for p in image_paths if (Path(val_labels_dir) / f"{p.stem}.csv").exists()]
+    if max_images:
+        image_paths = image_paths[:max_images]
+    model.eval()
+    predictions, sizes = {}, {}
+    try:
+        for image_path in tqdm(image_paths, desc="Box validation", leave=False):
+            predictions[image_path.stem] = single_image(
+                model, processor, str(image_path), prompt, max_image_size, normalized=normalized
+            )
+            with Image.open(image_path) as im:
+                sizes[image_path.stem] = im.size
+    finally:
+        model.train()
+    return predictions, sizes
+
+
+def make_box_callback(model, processor, box_val_dir, box_val_max, margin_start, margin_end, threshold, prompt, max_image_size, normalized, adapter_dir):
+    val_dir = Path(box_val_dir)
+    log_path = Path(adapter_dir) / "box_val.jsonl"
+    best = {"f1": -1.0}
+
+    def callback(phase, epoch, epochs):
+        predictions, sizes = box_validation(
+            model, processor, val_dir / "images", val_dir / "labels", box_val_max, prompt, max_image_size, normalized
+        )
+        margin = box_check.margin_for_epoch(epoch, epochs, margin_start, margin_end)
+        current = box_check.evaluate_box(predictions, val_dir / "labels", sizes, margin, threshold)
+        final = box_check.evaluate_box(predictions, val_dir / "labels", sizes, margin_end, threshold)
+        tqdm.write(
+            f"Phase {phase} epoch {epoch + 1}/{epochs} box val: F1 {current['f1']:.3f} (margin {margin:.3f}), "
+            f"F1 {final['f1']:.3f} (margin {margin_end:.3f})"
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
+            f.write(json.dumps({"phase": phase, "epoch": epoch + 1, "current": current, "final_margin": final}) + "\n")
+        if final["f1"] > best["f1"]:
+            best.update(final, phase=phase, epoch=epoch + 1)
+            model.save_pretrained(Path(adapter_dir) / "best_box")
+            (Path(adapter_dir) / "best_box" / "box_val.json").write_text(json.dumps(best, indent=2))
+
+    return callback
+
+
+def run_phase(model, processor, ntl_fn, ntl_weight, examples, epochs, lr, max_image_size, prompt, adapter_dir, phase, start_epoch, on_epoch_end=None, low_mem=False):
+    if low_mem:
+        optimizer = bnb.optim.AdamW8bit([p for p in model.parameters() if p.requires_grad], lr=lr)
+    else:
+        optimizer = AdamW(model.parameters(), lr=lr)
     input_device = model.get_input_embeddings().weight.device
     step = 0
 
@@ -160,7 +210,7 @@ def _run_phase(model, processor, ntl_fn, ntl_weight, examples, epochs, lr, max_i
                     step += 1
                     progress.set_postfix(loss=f"{loss_value:.4f}", avg=f"{epoch_loss / n_steps:.4f}")
                     if step % CHECKPOINT_EVERY_STEPS == 0:
-                        _save_checkpoint(model, adapter_dir, phase, epoch)
+                        save_checkpoint(model, adapter_dir, phase, epoch)
             except torch.OutOfMemoryError:
                 tqdm.write(f"Skipping {image_path.name}: CUDA out of memory")
                 outputs = None
@@ -173,17 +223,21 @@ def _run_phase(model, processor, ntl_fn, ntl_weight, examples, epochs, lr, max_i
 
         if n_steps:
             tqdm.write(f"Phase {phase} epoch {epoch + 1}/{epochs} mean loss: {epoch_loss / n_steps:.4f} ({n_steps} steps)")
-        _save_checkpoint(model, adapter_dir, phase, epoch + 1)
+        save_checkpoint(model, adapter_dir, phase, epoch + 1)
+        if on_epoch_end is not None:
+            on_epoch_end(phase, epoch, epochs)
 
 
 def finetune(
     train_images_dir, train_labels_dir, adapter_dir, epochs=1, lr=1e-4, use_4bit=True, device="auto",
     max_image_size=384, normalized=False, prompt=None, real_epochs=1, real_lr=2e-5, ntl_weight=NTL_WEIGHT,
+    box_val_dir=None, box_val_max=0, box_margin_start=box_check.MARGIN_FRAC, box_margin_end=box_check.MARGIN_FRAC,
+    box_threshold=box_check.INSIDE_THRESHOLD, low_mem=False, lora_r=LORA_RANK,
 ):
     model, processor = load_model(finetuned=False, use_4bit=use_4bit, device=device)
     prompt = prompt or (PROMPT_NORMALIZED if normalized else PROMPT)
     checkpointing_kwargs = {"use_reentrant": False}
-    if use_4bit:
+    if use_4bit and not low_mem:
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs=checkpointing_kwargs
         )
@@ -195,27 +249,38 @@ def finetune(
     if (Path(adapter_dir) / "adapter_config.json").exists():
         model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=True)
     else:
-        model = get_peft_model(model, LORA_CONFIG)
+        model = get_peft_model(model, lora_config(lora_r))
+    if low_mem:
+        for param in model.parameters():
+            if param.requires_grad:
+                param.data = param.data.to(torch.bfloat16)
     model.train()
     ntl_fn = NTLoss(tokenizer=processor.tokenizer, vocab_size=model.get_output_embeddings().out_features)
 
-    examples = _build_examples(train_images_dir, train_labels_dir, max_image_size, normalized)
-    synthetic = [e for e in examples if _is_synthetic(e[0])]
-    real = [e for e in examples if not _is_synthetic(e[0])]
+    examples = build_examples(train_images_dir, train_labels_dir, max_image_size, normalized)
+    synthetic = [e for e in examples if is_synthetic(e[0])]
+    real = [e for e in examples if not is_synthetic(e[0])]
 
     phases = []
     if synthetic:
         phases.append(("synthetic", synthetic, epochs, lr))
     phases.append(("real", real or examples, real_epochs, real_lr))
 
-    progress = _load_progress(adapter_dir)
+    on_epoch_end = None
+    if box_val_dir:
+        on_epoch_end = make_box_callback(
+            model, processor, box_val_dir, box_val_max, box_margin_start, box_margin_end, box_threshold,
+            prompt, max_image_size, normalized, adapter_dir,
+        )
+
+    progress = load_progress(adapter_dir)
     resumed = False
     for phase, phase_examples, phase_epochs, phase_lr in phases:
         if not resumed and progress.get("phase") and progress["phase"] != phase:
             continue
         start_epoch = progress["epoch"] if (not resumed and progress.get("phase") == phase) else 0
         resumed = True
-        _run_phase(model, processor, ntl_fn, ntl_weight, phase_examples, phase_epochs, phase_lr, max_image_size, prompt, adapter_dir, phase, start_epoch)
+        run_phase(model, processor, ntl_fn, ntl_weight, phase_examples, phase_epochs, phase_lr, max_image_size, prompt, adapter_dir, phase, start_epoch, on_epoch_end, low_mem)
 
     Path(adapter_dir).mkdir(parents=True, exist_ok=True)
     model.save_pretrained(adapter_dir)
